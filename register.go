@@ -144,13 +144,13 @@ func (r *Registering) Query(handler any, handlers ...any) Register {
 func (r *Registering) Add(methods []string, handler any, handlers ...any) Register {
 	converted := collectHandlers("register", append([]any{handler}, handlers...)...)
 	var inner []Handler
-	pattern := ""
+	var hosts []domainMatcher
 	if r.domain != nil {
 		inner = converted
 		converted = r.domain.wrapHandlers(converted)
-		pattern = r.domain.pattern()
+		hosts = r.domain.hosts()
 	}
-	regID := r.app.registerChain(methods, r.path, r.group, pattern, inner, converted)
+	regID := r.app.registerChain(methods, r.path, r.group, hosts, inner, converted)
 	r.cursor.Store(regID)
 	switch {
 	case r.domain != nil:

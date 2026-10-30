@@ -80,6 +80,17 @@ We have made several changes to the Fiber app, including:
 - **Trusted Proxy Configuration**: The `EnabledTrustedProxyCheck` has been moved to `app.Config.TrustProxy`, and `TrustedProxies` has been moved to `TrustProxyConfig.Proxies`. Additionally, `ProxyHeader` must be set to read client IPs from proxy headers (e.g., `X-Forwarded-For`).
 - **XMLDecoder Config Property**: The `XMLDecoder` property has been added to allow usage of 3rd-party XML libraries in XML binder.
 - **SkipUnmatchedRoutes Config Property**: Opt-in flag that answers requests with no matching route with `404`/`405` before the middleware chain runs. Note that middleware (loggers, static or catch-all responders) does not run for these requests; CORS preflight requests are exempt so cors middleware keeps working. Customize the responses via `ErrorHandler`.
+- **StreamRequestBody**: A `multipart/form-data` body is no longer parsed by the server before the handlers run, as if
+  `DisablePreParseMultipartForm` were set: the pre-parse ignored `BodyLimit` and stored an upload of any declared length
+  before a middleware could refuse it. `FormFile`, `MultipartForm` and `Bind().Form()` parse it on demand within
+  `BodyLimit`, so an app that takes larger uploads this way has to raise the limit or read `BodyStream()`. `Body()`,
+  `BodyRaw()` and `FormValue()` now read a streamed body within `BodyLimit` too and answer a larger one
+  `413 Request Entity Too Large` while no response body was written, and the body binders fail on it; only `BodyStream()` reads past the limit.
+  `Bind().All()` reads the body only when the request has a `Content-Type`. `net/http` handlers, registered directly or
+  through the adaptor, and `adaptor.ConvertRequest` answer a streamed body larger than `BodyLimit` with `413` as well,
+  and the cache middleware leaves a request whose streamed body is chunked or longer than `BodyLimit` uncached instead
+  of reading it to build the key. The logger's `${body}` and `${form:}` read it within `BodyLimit` too, without
+  changing the handler's response.
 - **Buffer sizes**: The default `ReadBufferSize` and `WriteBufferSize` are now `8192` bytes (they were `4096` in v2). The read buffer also limits the size of the request headers, so requests with larger headers or cookies are accepted by default. Set either field to keep a different size.
 
 ### New Methods
@@ -376,9 +387,33 @@ The router normalizes every request path before matching, as [RFC 3986 Section 6
 
 `c.Path()` returns the normalized path. `c.OriginalURL()` still returns the request target as the client sent it.
 
+### Path and method overrides
+
+After `c.Path(...)` or `c.Method(...)`, `c.Next()` continues with the routes registered after the current one that match the new path and method. Before, a handler mounted on a prefix, such as `app.Use("/v1", rewrite.New(...))` or `http.StripPrefix` through `adaptor.HTTPMiddleware`, or registered for a single method resumed at a position taken from another route list, and skipped routes registered after it, middleware included. A `Use` registered right after a route for a single method is no longer merged into the previous `Use` under the other methods, and a route is merged into the one before it on the same path only when both were registered for the same methods: `app.Get` after `app.All` or a multi-method `app.Add` on one path stays a route of its own, so `app.Stack()` can list one more route there.
+
+### Trailing slashes
+
+Without `StrictRouting`, a path of slashes alone, such as `//`, is matched as `/`, the way `/about//` is matched as `/about`. Before, it was matched as the empty path, which a root `app.Use` did not cover while a `/*` or `/:name?` route still answered it. A route registered as `//` is the root route now, and `//` also answers a `/` route. `c.Path()` still returns `//`.
+
+With `StrictRouting`, middleware registered with `Use` on `/users/` also runs for `/users`, which routes below it such as `/users/:id?` and `/users/*` answer. Before, a mounted app's own `Use` middleware, composed as `/users/`, and `Group("/users").Use("/", mw)` did not run for `/users` while such a route of theirs still answered it. `RemoveRoute("/users/")` still removes such middleware.
+
 ### Optional parameters
 
 An optional parameter that ends at a single-character constant, such as `:month?-` or `:name?.`, no longer matches across a `/`. Before, `/api/:day-:month?-:year?` matched `/api/1-/-` with `month` set to `/`, and `/file/:name?.:ext` matched `/file/a/b.txt` with `name` set to `a/b`; both now return 404. A required parameter keeps its behavior: `/file/:name.:ext` still matches `/file/a/b.txt`. With `UnescapePath` on, `Route.URL`, `GetRouteURL` and `Redirect().Route` return `ErrRouteNotRepresentable` for a `/` in the value of such an optional parameter.
+
+### Mount prefixes
+
+The routes of a mounted app are re-parsed with the mount prefix as written. Before, they were re-parsed from its comparison key, which has the case folded and the escapes removed: an escaped literal such as `/v1\:internal` became a parameter, and a custom constraint with an upper-case name such as `/tenants/:id<tenantID>` was dropped, so the mounted routes answered paths that middleware on the same prefix did not cover. `Route.Path` of a mounted route now keeps the prefix's case and escapes, as it does for a route registered through a `Group`.
+
+### Wildcards and parameters in middleware prefixes
+
+A `Use`, `Group` or mount prefix whose only wildcard is followed only by literal text, such as `app.Use("/api/*/admin", mw)`, now covers every path in which that text ends a path segment, such as `/api/acme/admin/admins`, which it skipped before while `/api/:tenant/admin/:page` answered it; other greedy shapes in a prefix keep the v3.6.1 behavior, including the trailing slash with `StrictRouting`, so use a named parameter in the prefix and in the routes below it, as in `/api/:tenant/admin/:id`.
+
+Likewise, a prefix without wildcards whose last segment ends in a named parameter followed by literal text, such as `app.Use("/files/:name.json", mw)`, now covers `/files/a.json.json/raw`, which `/files/:name.json/raw` answered with `name` set to `a.json`; the parameter still ends at the first copy of the text when it is optional, has a constraint or shares its segment with another parameter.
+
+### Use with a sub-app
+
+`Use` panics when one call receives both handlers and a sub-app, as in `app.Use("/admin", auth, adminApp)`, on an `App`, a `Group` and a `Domain` router. Before, it mounted the sub-app and dropped the handlers without an error. Register them in separate calls: `app.Use("/admin", auth)`, then `app.Use("/admin", adminApp)`. It also panics on two sub-apps in one call, which mounted only the last, and on two path arguments, such as `app.Use("/admin", "/internal", auth)` or a path next to a `[]string`, which registered the handlers on only one of them. Pass several paths as one `[]string`.
 
 ### Generated route URLs
 
@@ -456,6 +491,8 @@ Named routes retrieved with `app.GetRoute(name)` also support `route.URL(params)
 `Domain` creates a router scoped to a specific hostname pattern. Routes registered through the returned `Router` only match requests whose hostname (from `c.Hostname()`) matches the pattern. When `TrustProxy` is enabled and the proxy is trusted (as defined by [`TrustProxyConfig`](./api/fiber#trustproxyconfig)), the hostname may be derived from the `X-Forwarded-Host` header. Be sure to configure `TrustProxyConfig` to restrict which proxies are trusted and prevent header spoofing when enabling `TrustProxy`.
 
 The pattern can contain parameters prefixed with `:`, accessible via `fiber.DomainParam`.
+
+Routes for one path registered through different `Domain` patterns stay separate routes, each with its own name and automatic `HEAD` route, even when they are registered one after another; [`c.Endpoint()`](./api/ctx#endpoint) reports a `Domain` route only for a hostname its pattern matches.
 
 Domain routing has **zero performance impact** on routes that don't use it because the hostname check is applied as a handler wrapper, not a change to the core router.
 
@@ -559,6 +596,8 @@ Other changes to existing routing behavior, made so routes can be documented saf
 - `fiber.Register` gained `Name` and the documentation methods. A type of your own that implements `fiber.Register` must add them.
 
 :::
+
+Each automatic `HEAD` route runs where its `GET` route does, and every `GET` route gets its own, also when a path has several. Before, they ran after every `Use` handler, mounted app and explicit `HEAD` route, so a guard registered with `Get`, such as `app.Get("/admin/*", auth)` followed by `app.Use("/admin", adminApp)` or `app.Use(static.New(dir))`, did not run for `HEAD`, and a `GET` route followed by a catch-all `Use` answered `HEAD` with that handler. A route registered for `HEAD` alone still replaces the automatic ones of its path in the same app and `Domain` pattern. One on another `Domain` pattern or in a mounted app now keeps its place in the route order, behind the automatic route of a `GET` route registered before it. One registered for `GET` and `HEAD` together, with `All` or `Add`, answers only for itself. Two apps mounted on one prefix now both get their `HEAD` routes, and a sub-app that leaves `HEAD` out of its `RequestMethods` answers `HEAD` with `405` behind nested `Domain` mounts as well.
 
 ### QUERY method (RFC 10008)
 
@@ -748,7 +787,7 @@ The `TypeConstraint` type, `Constraint.ID`, and `Constraint.RegexCompiler` field
 - **AcceptsXML**: Reports whether the `Accept` header allows XML.
 - **AcceptsEventStream**: Reports whether the `Accept` header allows `text/event-stream`.
 - **Matched**: Detects when the current request path matched a registered route.
-- **Endpoint**: Looks ahead to the route that will handle the request, without advancing the handler chain, so global middleware can read its `Path` or `Name` before calling `Next`. It returns `nil` when no route will run.
+- **Endpoint**: Looks ahead to the route that will handle the request, without advancing the handler chain, so global middleware can read its `Path` or `Name` before calling `Next`. It returns `nil` when no route will run. A route registered through `Domain` is reported only for a hostname its pattern matches.
 - **IsMiddleware**: Indicates if the current handler was registered as middleware.
 - **HasBody**: Quickly checks whether the request includes a body.
 - **OverrideParam**: Overwrites the value of an existing route parameter, or does nothing if the parameter does not exist
@@ -867,6 +906,16 @@ resolve to the **request**; use `c.Res().Get()`, `c.Res().GetHeaders()`, `c.Res(
   The unit is case-insensitive (`Bytes=0-4` used to get `416`). `If-Range` was ignored, so a resumed download was
   spliced onto a file that had changed; the range is now served only when the date in `If-Range` is exactly the file's
   `Last-Modified` (and at least two seconds old), and the whole file is sent otherwise.
+- **Body()**: A `Content-Encoding` list of more than five codings, `identity` members included, is now answered
+  `415 Unsupported Media Type` before anything is decoded, since `BodyLimit` bounds each decoding step but not their
+  number. A chain of codings is now undone without replacing the request body, so slices returned by an earlier
+  `BodyRaw()` or by `Body()` stay valid for the whole handler, also under `ReduceMemoryUsage` and behind the adaptor
+  middleware.
+- **Render()**: The `fiber.Map` passed as `bind` is no longer modified. `ViewBind` values and, with
+  `PassLocalsToViews`, the `Locals` used to be written into it, so a map kept across requests carried the first
+  request's values into every later render, and a nil `fiber.Map` panicked. They are now merged into a copy, and a
+  key in the passed map still wins. Without a `Views` engine, `Render` now parses a copy of the template file, so
+  the output no longer depends on `Config.Immutable`.
 - **Context()**: Renamed to `RequestCtx()` to access the underlying `fasthttp.RequestCtx`.
 - **IP()**: When `EnableIPValidation` is `true` and `TrustProxyConfig` is set, `c.IP()` now walks the `X-Forwarded-For` chain from right to left and returns the first non-trusted IP, instead of the leftmost syntactically valid IP. This closes an IP-spoofing vector where an attacker could prepend a fake address and have it returned by `c.IP()`. Apps with `EnableIPValidation = false` (the default) are unaffected. See [`Ctx.IP`](./api/ctx.md#ip) and the [reverse proxy guide](./guide/reverse-proxy.md#getting-the-real-client-ip-address) for details.
 
@@ -1004,6 +1053,9 @@ Fiber v3 introduces a new binding mechanism that simplifies the process of bindi
 - Support for unified binding (`Bind().All()`) with defined precedence order: (URI -> Body -> Query -> Headers -> Cookies). A struct can customize the order for all its fields with one `binding_source` tag on any top-level field. [Learn more](./api/bind.md#all).
 - Support MsgPack binding for request body.
 - Support `map[string]T` struct fields in query and form binding: `attributes[color]=red` or `attributes.color=red` fills `Attributes map[string]string`, and maps of slices keep repeated values. [Learn more](./api/bind.md#map-fields).
+- With `EnableSplittingOnParsers`, the header and response header binders read a comma-separated value as an HTTP list: the spaces and tabs around each element are removed and empty elements are skipped, so `X-Ids: 1, 2` binds `[]int{1, 2}`. This also applies to a `map[string][]string`, whose elements no longer keep a leading space. [Learn more](./api/bind.md#header).
+
+A key bound into a struct can have at most 64 segments (`items[0][sku]` has three). A deeper key fails the bind with `binder.ErrKeyTooDeep`; map destinations are not limited. In a struct with a slice of structs inside a slice element or below a field of its own type, an index that can grow such a slice, such as the `3` in `items[0][variants][3][sku]`, counts as its value plus one elements of the largest such slice element, and keys that add up to more than 8 MiB fail the bind with `binder.ErrTooManyElements`. [Learn more](./api/bind.md#nested-and-array-form-fields).
 
 <details>
 <summary>Example</summary>
@@ -1151,8 +1203,9 @@ fmt.Println(resp.StatusCode(), resp.String())
 
 :::caution
 A path parameter value now fills exactly one path segment. A value holding `/`
-or `\`, a value that is exactly `.` or `..`, and an empty value are rejected
-with `ErrPathParamInPath`; a value substituted into the host must already be a
+or `\`, a value that is exactly `.` or `..`, an empty value, and one of those
+followed by `;` parameters, such as `..;`, are rejected with
+`ErrPathParamInPath`; a value substituted into the host must already be a
 valid host or the request fails with `ErrPathParamInHost`. Previously such a
 value was pasted in unchanged, so `SetPathParam("id", "../../admin")` on
 `/api/:id` quietly sent the request to `/admin`. Call
@@ -1160,8 +1213,8 @@ value was pasted in unchanged, so `SetPathParam("id", "../../admin")` on
 purpose (for a client from `NewWithClient`, create the fasthttp client with
 `DisablePathNormalizing: true` as well); the setting on a single request only
 counts for a client that already sends paths as written. `.`, `..` and an empty
-value stay rejected either way, because a server resolves a dot segment and may
-merge slashes.
+value stay rejected either way, with or without `;` parameters, because a server
+resolves a dot segment and may merge slashes.
 :::
 
 :::note
@@ -1178,6 +1231,10 @@ it used to carry an empty one.
 - Dialer, TLS, and proxy helpers now update every host client inside a load balancer, so complex pools inherit the same configuration.
 - The Fiber client exposes `Do`, `DoTimeout`, `DoDeadline`, `DoRedirects`, and `CloseIdleConnections`, matching the surface area of the wrapped fasthttp transports.
 - Redirects are off by default (`MaxRedirects` is `0`). The `Request` methods follow them for `GET`, `HEAD` and `QUERY` requests only, while `Client.DoRedirects` follows any method. A redirect to a host that is neither the original hostname (on any port) nor one of its subdomains drops the credentials of the original request (`Authorization`, `Proxy-Authorization`, `Cookie` and related headers), and a redirect from HTTPS to HTTP fails with `client.ErrRedirectDowngrade`. Headers named with `Client.SetRedirectSensitiveHeaders`, `Request.SetRedirectSensitiveHeaders` or `Config.RedirectSensitiveHeaders` are dropped with them, and all of them are removed whatever case they are stored under; every other header is forwarded. With a retry configuration, a chain that fails is retried from the original request.
+- A client from `client.New`, the default client behind `client.Get` and the other package-level helpers included, buffers a response body of at most 100 MiB and fails a larger one with `fasthttp.ErrBodyTooLarge`. `SetMaxResponseBodySize` changes the limit, and `SetStreamResponseBody(true)` reads a body without buffering it. A wrapped `fasthttp` client keeps its own `MaxResponseBodySize`.
+- A timeout, set with `SetTimeout`, `Config.Timeout` or a context deadline, now bounds the transport as well as the caller: every attempt, retry and redirect hop gets what is left of it, the connection is closed when it passes, and retries stop once the call is over. On a client from `client.New` it also bounds the TLS handshake. With response streaming the deadline also ends reads from `Response.BodyStream()`, so leave it unset for a long-lived stream.
+- A `Request` sent again picks its cookies anew: it no longer carries the cookie jar's cookies for its previous URL or a cookie deleted or expired since, and a cookie written straight to `RawRequest` before the send is dropped. The cookie jar drops a cookie without a name and trims whitespace around a name, and only a host name matches a cookie `Domain` by suffix: an IP address, with or without an IPv6 zone, matches only itself.
+- `SetParam`, `SetParams`, `SetFormData` and `SetFormDataWithMap` on a `Request`, `SetParam`, `SetParams` and `SetHeader` on the `Client`, and `QueryParam.Set` and `FormData.Set` replace every value stored under the key, not only the first, so a value added before with `AddParam`, `AddFormData` or `AddHeader` is no longer sent next to the new one. The key moves to the end of the query string or form body.
 
 ## 🧰 Generic functions
 
@@ -1959,7 +2016,7 @@ The proxy is secure by default. Upstreams that resolve to loopback, private, lin
 
 `ErrUpstreamHostUnresolvable` is new: a name that cannot be resolved, or that resolves to no address, is rejected with an error that matches it and `ErrUpstreamHostBlocked` both, and `errors.As` finds the `*net.DNSError` of the lookup. A host with only IPv6 addresses and `DialDualStack` off fails with an error that matches neither, where it matched `ErrUpstreamHostBlocked` before. An address `net/url` cannot parse is rejected with `ErrUpstreamHostInvalid` and the `*url.Error` wrapped beside it, so the message of that error carries the parse error. The time `DoTimeout`, `DoDeadline` or `Config.Timeout` allows bounds the lookup and the connects of the request as well; a connect that nothing bounds has five seconds, as before.
 
-`Balancer`, `DomainForward` and `BalancerForward` forward the path the router matched, `c.Path()`, followed by the query as the client sent it, instead of the request line as it arrived. Spellings such as `/public/..%2Fadmin/secret` and `//admin/secret`, which fasthttp's normalization of the raw request line turned into `/admin/secret` on the way to the upstream, are answered with `400 Bad Request`, since an upstream that decodes `%2F` or merges `//` before it matches routes would still serve a path no middleware matched; the new `SecurityPolicy.AllowAmbiguousSlashes` forwards them exactly as the router matched them, for an upstream that keeps both. A path parameter, a `;` in any segment, is answered with `400` as well: servlet containers such as Tomcat and Jetty strip the parameters from every segment before they match routes, so `/admin;x/secret`, `/admin;/secret` and `/;/admin/secret` are `/admin/secret` there. The new `SecurityPolicy.AllowPathParameters` forwards them, for an upstream that relies on `;jsessionid`; a client can also send a literal `;` as `%3B`. A path holding a backslash, a dot segment carrying parameters (`..;`), or an escape of an unreserved character, which only a stray `%` can forge, is answered with `400` regardless. A path with dot segments is forwarded resolved, and a byte a path may not carry raw is forwarded as its escape. Every entry in `Config.Servers` must be a scheme and host only; an entry with a path, userinfo, query or fragment panics at startup with `ErrUpstreamNotOrigin`. `Balancer` also answers `400 Bad Request` for a request whose `Host` header carries userinfo and for a routed target fasthttp would read as an authority rather than a path (one that begins with `//` and holds `://`, or one beginning with `//` on a request without a `Host` header). A path override without a leading slash is forwarded rooted. Every `*fasthttp.HostClient` in a custom `Client` gets `DisablePathNormalizing` set, and behind any other `BalancingClient` a target that normalization would change is answered with `400`. Path normalization is also disabled on the default client, on a client registered with `WithClient` and on every host client a per-call client creates once the proxy has it. See [Request target](./middleware/proxy.md#request-target).
+`Balancer`, `DomainForward` and `BalancerForward` forward the path the router matched, `c.Path()`, followed by the query as the client sent it, instead of the request line as it arrived. Spellings such as `/public/..%2Fadmin/secret` and `//admin/secret`, which fasthttp's normalization of the raw request line turned into `/admin/secret` on the way to the upstream, are answered with `400 Bad Request`, since an upstream that decodes `%2F` or merges `//` before it matches routes would still serve a path no middleware matched; the new `SecurityPolicy.AllowAmbiguousSlashes` forwards them exactly as the router matched them, for an upstream that keeps both. A path parameter, a `;` in any segment, is answered with `400` as well: servlet containers such as Tomcat and Jetty strip the parameters from every segment before they match routes, so `/admin;x/secret`, `/admin;/secret` and `/;/admin/secret` are `/admin/secret` there. The new `SecurityPolicy.AllowPathParameters` forwards them, for an upstream that relies on `;jsessionid`; a client can also send a literal `;` as `%3B`. A path holding a backslash, a dot segment carrying parameters (`..;`), or an escape of an unreserved character, which only a stray `%` can forge, is answered with `400` regardless. A path with dot segments is forwarded resolved, and a byte a path may not carry raw is forwarded as its escape. Every entry in `Config.Servers` must be a scheme and host only; an entry with a path, userinfo, query or fragment panics at startup with `ErrUpstreamNotOrigin`. `Balancer` answers `400 Bad Request` for an absolute-form request, such as `GET http://public.example/x`, whose `Host` header names another host or is missing: `c.Host()`, `app.Domain` and `hostauthorization` went by the host of the request line, the upstream by the `Host` header ([RFC 9112 Section 3.2.2](https://www.rfc-editor.org/rfc/rfc9112#section-3.2.2)). The two are compared without regard to case or to a default port, and only a host name or an IP address, with an optional port, can match. An application that sets the `Host` header in a middleware before `Balancer` now gets `400` for an absolute-form request whose line names another host than the one it set, and an HTTP/1.0 absolute-form request without `Host` is refused before `ModifyRequest` runs; set the upstream `Host` in `ModifyRequest` instead. `DomainForward` and `BalancerForward` keep the escapes of the routed path and of their upstream URL's path as written, so `%3B` behind `http://backend/my%20app` is no longer sent as `;`. `Balancer` also answers `400 Bad Request` for a request whose `Host` header carries userinfo and for a routed target fasthttp would read as an authority rather than a path (one that begins with `//` and holds `://`, or one beginning with `//` on a request without a `Host` header). A path override without a leading slash is forwarded rooted. Every `*fasthttp.HostClient` in a custom `Client` gets `DisablePathNormalizing` set, and behind any other `BalancingClient` a target that normalization would change is answered with `400`. Path normalization is also disabled on the default client, on a client registered with `WithClient` and on every host client a per-call client creates once the proxy has it. See [Request target](./middleware/proxy.md#request-target).
 
 `Balancer`, `Forward`, `DomainForward` and `BalancerForward` no longer forward a request the server refused while reading it, such as one over `BodyLimit`: the client is answered with the refusal, and the upstream used to run a copy of the request without its body.
 
@@ -3297,6 +3354,8 @@ Fiber now also warns at startup when a rule can never fire because an earlier on
 
 - **A rule matches the whole path**: both ends of the pattern are anchored, so a rule no longer matches just a suffix of the path, and an alternation such as `/a|/b` cannot match by prefix or suffix alone (#4476).
 
+- **A capture cannot leave the target's path**: a rule whose composed location holds more `.` or `..` segments than its target is skipped for that request, so `{From: "/@*", To: "https://cdn.example.com/public/$1"}` no longer sends `/@../other/x` to `https://cdn.example.com/public/../other/x`.
+
 - **A capture may no longer stand inside a target's authority**, which covers the host, the port and any userinfo: `"https://$1.cdn.example.com/"`, `"https://cdn.example.com:$1"` and `"https://$1"` are refused at startup with a warning, and those rules never fire. Whether such a value was safe depended on percent-decoding, IDNA mapping, numeric labels read as IPv4 addresses, IPv6 brackets and userinfo, and each of those was a way to move the host somewhere the target did not name. A capture in the path, query or fragment is unchanged. Where the destination host genuinely varies, pick it in a handler and use `c.Redirect()`, where the value is yours to validate.
 
 #### CSRF
@@ -3539,6 +3598,7 @@ app.Use(rewrite.New(rewrite.Config{
 
 `Rules` keeps working for the whole of v3; its keys are ranked most path text before the first `*`, then most path text overall, then fewest asterisks, then the key. Setting both fields panics.
 
+- **A capture cannot leave `To`**: a rewritten path holding more `.` or `..` segments than `To` itself is skipped for that request, so `{From: "/@*", To: "/users/$1"}` no longer rewrites `/@../admin` to `/admin`.
 - **A rule is path text**: `From` is no longer compiled as an unescaped regular expression. `*` matches a run of any bytes but a newline and every other byte stands for itself, so `/preis-1.000-euro` rewrites that path and no longer also `/preis-1X000-euro`, and `/faq?` no longer rewrites `/fa`. This also completes the anchoring fix from #4476: `"^" + "/a|/b" + "$"` parsed as `(^/a)|(/b$)`, so a rule could match by prefix or suffix alone. Rules written with path text and `*` are unaffected; a rule relying on regular-expression syntax now matches the literal characters it spells.
 
 #### Session

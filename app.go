@@ -61,9 +61,6 @@ func (l ParamLocation) Normalize() ParamLocation {
 	return ParamLocation(utilsstrings.ToLower(utils.TrimSpace(string(l))))
 }
 
-// allHosts is the domain of a route registered outside a domain router.
-const allHosts = ""
-
 const defaultResponseKey = "default"
 
 const smallIndexMax = 8
@@ -248,6 +245,7 @@ type Config struct { //nolint:govet // Aligning the struct fields is not necessa
 
 	// When set to true, the router treats "/foo" and "/foo/" as different.
 	// By default this is disabled and both "/foo" and "/foo/" will execute the same handler.
+	// Middleware registered with Use on "/foo/" runs for "/foo" either way.
 	//
 	// Default: false
 	StrictRouting bool `json:"strict_routing"`
@@ -455,6 +453,9 @@ type Config struct { //nolint:govet // Aligning the struct fields is not necessa
 	// and calls the handler sooner when given body is
 	// larger than the current limit.
 	//
+	// Only BodyStream reads such a body: Body, FormValue and the binders still
+	// apply BodyLimit, and a multipart form is never pre-parsed.
+	//
 	// Default: false
 	StreamRequestBody bool
 
@@ -463,7 +464,8 @@ type Config struct { //nolint:govet // Aligning the struct fields is not necessa
 	// This option is useful for servers that desire to treat
 	// multipart form data as a binary blob, or choose when to parse the data.
 	//
-	// Server pre parses multipart form data by default.
+	// Server pre parses multipart form data by default, but never with
+	// StreamRequestBody.
 	//
 	// Default: false
 	DisablePreParseMultipartForm bool
@@ -1115,19 +1117,38 @@ func (app *App) bumpRoutesRevision() {
 //
 // This method will match all HTTP verbs: GET, POST, PUT, HEAD etc...
 func (app *App) Use(args ...any) Router {
-	var prefix string
-	var subApp *App
-	var prefixes []string
-	var handlers []Handler
+	prefixes, subApp, handlers := useArgs(args)
 
-	for i := range args {
-		switch arg := args[i].(type) {
+	for _, prefix := range prefixes {
+		if subApp != nil {
+			// Every prefix mounts the sub-app, as every prefix registers a handler.
+			app.mount(prefix, subApp)
+			continue
+		}
+
+		app.register([]string{methodUse}, prefix, nil, handlers...)
+	}
+
+	return app
+}
+
+// useArgs sorts the arguments of a Use call. Anything it would otherwise drop
+// silently panics: a second prefix argument, a second sub-app, or handlers next to a sub-app.
+func useArgs(args []any) (prefixes []string, subApp *App, handlers []Handler) { //nolint:nonamedreturns // names tell the three results apart
+	prefixArgs := 0
+	for _, arg := range args {
+		switch arg := arg.(type) {
 		case string:
-			prefix = arg
-		case *App:
-			subApp = arg
+			prefixes = []string{arg}
+			prefixArgs++
 		case []string:
 			prefixes = arg
+			prefixArgs++
+		case *App:
+			if subApp != nil {
+				panic("use: only one sub-app can be passed in one call\n")
+			}
+			subApp = arg
 		default:
 			handler, ok := toFiberHandler(arg)
 			if !ok {
@@ -1137,21 +1158,16 @@ func (app *App) Use(args ...any) Router {
 		}
 	}
 
+	if prefixArgs > 1 {
+		panic("use: pass several prefixes as one []string\n")
+	}
+	if subApp != nil && len(handlers) > 0 {
+		panic("use: handlers and a sub-app cannot be passed in one call\n")
+	}
 	if len(prefixes) == 0 {
-		prefixes = append(prefixes, prefix)
+		prefixes = []string{""}
 	}
-
-	for _, prefix := range prefixes {
-		if subApp != nil {
-			// Every prefix mounts the sub-app, as every prefix registers a handler.
-			app.mount(prefix, subApp)
-			continue
-		}
-
-		app.register([]string{methodUse}, prefix, nil, allHosts, handlers...)
-	}
-
-	return app
+	return prefixes, subApp, handlers
 }
 
 // Get registers a route for GET methods that requests a representation
@@ -1217,7 +1233,7 @@ func (app *App) Query(path string, handler any, handlers ...any) Router {
 // The provided handlers are executed in order, starting with `handler` and then the variadic `handlers`.
 func (app *App) Add(methods []string, path string, handler any, handlers ...any) Router {
 	converted := collectHandlers("add", append([]any{handler}, handlers...)...)
-	app.register(methods, path, nil, allHosts, converted...)
+	app.register(methods, path, nil, converted...)
 
 	return app
 }
@@ -1235,7 +1251,7 @@ func (app *App) Group(prefix string, handlers ...any) Router {
 	grp := newGroup(app, prefix, nil)
 	if len(handlers) > 0 {
 		converted := collectHandlers("group", handlers...)
-		grp.cursor.Store(app.register([]string{methodUse}, prefix, grp, allHosts, converted...))
+		grp.cursor.Store(app.register([]string{methodUse}, prefix, grp, converted...))
 	}
 	if err := app.hooks.executeOnGroupHooks(*grp); err != nil {
 		panic(err)
@@ -1661,7 +1677,9 @@ func (app *App) init() *App {
 		app.server.GetOnly = app.config.GETOnly
 		app.server.ReduceMemoryUsage = app.config.ReduceMemoryUsage
 		app.server.StreamRequestBody = app.config.StreamRequestBody
-		app.server.DisablePreParseMultipartForm = app.config.DisablePreParseMultipartForm
+		// fasthttp pre-parses a streamed multipart body of any length before the
+		// handler runs; MultipartForm parses it on demand within BodyLimit instead.
+		app.server.DisablePreParseMultipartForm = app.config.DisablePreParseMultipartForm || app.config.StreamRequestBody
 	}()
 
 	// Register the Services shutdown handler once the app is initialized and unlocked.
@@ -1897,6 +1915,7 @@ func (app *App) prepareStartup() ([]*Route, []subAppTwins) {
 		}
 	}
 	app.mountStartupProcess()
+	subTwins = append(subTwins, app.takeCreatedTwinsLocked()...)
 
 	// build route tree stack
 	app.buildTree()

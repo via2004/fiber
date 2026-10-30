@@ -1299,10 +1299,10 @@ func Test_AutoHeadPrune_IsDomainScoped(t *testing.T) {
 			continue
 		}
 		if route.IsAutoHead() {
-			twins[route.domain]++
+			twins[route.Domain()]++
 			continue
 		}
-		explicit[route.domain]++
+		explicit[route.Domain()]++
 	}
 	require.Equal(t, map[string]int{"b.example": 1}, twins)
 	require.Equal(t, map[string]int{"a.example": 1}, explicit)

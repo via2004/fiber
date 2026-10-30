@@ -6,7 +6,6 @@ package fiber
 
 import (
 	"fmt"
-	"reflect"
 	"slices"
 	"strings"
 
@@ -277,15 +276,11 @@ func (d *domainRouter) remember(regID uint64) {
 	}
 }
 
-func (d *domainRouter) pattern() string {
-	return d.matcher.pattern
-}
-
 // Verify domainRouter implements Router at compile time.
 var _ Router = (*domainRouter)(nil)
 
 func (d *domainRouter) registerWrapped(methods []string, path string, group *Group, handlers []Handler) uint64 {
-	return d.app.registerChain(methods, path, group, d.pattern(), handlers, d.wrapHandlers(handlers))
+	return d.app.registerChain(methods, path, group, d.hosts(), handlers, d.wrapHandlers(handlers))
 }
 
 // wrapHandlers wraps every handler in the slice with domain checking.
@@ -343,6 +338,29 @@ func (d *domainRouter) wrapHandlers(handlers []Handler) []Handler {
 	return result
 }
 
+// hosts returns the patterns a route registered through d records, which are
+// the ones wrapHandlers filters its handlers on. See Route.hosts.
+func (d *domainRouter) hosts() []domainMatcher {
+	return []domainMatcher{d.matcher}
+}
+
+// servesHost reports whether the request's hostname satisfies every Domain
+// pattern the route is behind, which is whether its handlers run or decline.
+func (r *Route) servesHost(c *DefaultCtx) bool {
+	if len(r.hosts) == 0 {
+		return true
+	}
+
+	hostname := c.Hostname()
+	for i := range r.hosts {
+		if matched, _ := r.hosts[i].match(hostname); !matched {
+			return false
+		}
+	}
+
+	return true
+}
+
 // registerPath returns the full path for registration, taking group prefix into account.
 func (d *domainRouter) registerPath(path string) string {
 	if d.group != nil {
@@ -368,31 +386,7 @@ func (d *domainRouter) registerGroup() *Group {
 //	    return c.Next()
 //	})
 func (d *domainRouter) Use(args ...any) Router {
-	var subApp *App
-	var prefix string
-	var prefixes []string
-	var handlers []Handler
-
-	for i := range args {
-		switch arg := args[i].(type) {
-		case string:
-			prefix = arg
-		case []string:
-			prefixes = arg
-		case *App:
-			subApp = arg
-		default:
-			handler, ok := toFiberHandler(arg)
-			if !ok {
-				panic(fmt.Sprintf("use: invalid handler %v", reflect.TypeOf(arg)))
-			}
-			handlers = append(handlers, handler)
-		}
-	}
-
-	if len(prefixes) == 0 {
-		prefixes = append(prefixes, prefix)
-	}
+	prefixes, subApp, handlers := useArgs(args)
 
 	for _, prefix := range prefixes {
 		if subApp != nil {
@@ -518,7 +512,7 @@ func (d *domainRouter) mount(prefix string, subApp *App) Router {
 	mountGroup := newGroup(wrapperApp, mountPath, nil)
 
 	// Register the mount point - the routes will be expanded during startup
-	d.remember(d.app.register([]string{methodUse}, mountPath, mountGroup, d.pattern()))
+	d.remember(d.app.register([]string{methodUse}, mountPath, mountGroup))
 
 	// Execute onMount hooks
 	if err := subApp.hooks.executeOnMountHooks(d.app); err != nil {
@@ -603,9 +597,16 @@ func (d *domainRouter) domainRoutes(dst, src *App, walk domainClone) [][]*Route 
 		route       *Route
 		owner       *App
 		constraints []CustomConstraint
+		// src's own mark: the app that opted out may be flattened into src already
+		skipAutoHead bool
 	}
 
 	src.mutex.Lock()
+	// As startupProcess does before a plain mount: src's HEAD routes are placed in its
+	// own route order, never by id against the routes of the apps it is flattened with.
+	if !skipAutoHead {
+		src.ensureAutoHeadRoutesLocked()
+	}
 	stack := make([][]sourceRoute, len(routes))
 	for m := range stack {
 		srcRoutes := src.routesForMethod(dst.method(m))
@@ -625,9 +626,10 @@ func (d *domainRouter) domainRoutes(dst, src *App, walk domainClone) [][]*Route 
 			}
 
 			stack[m][i] = sourceRoute{
-				route:       src.copyRoute(route),
-				owner:       owner,
-				constraints: src.routeConstraintsFor(route),
+				route:        src.copyRoute(route),
+				owner:        owner,
+				constraints:  src.routeConstraintsFor(route),
+				skipAutoHead: src.skipsAutoHeadFor(route),
 			}
 		}
 	}
@@ -651,7 +653,7 @@ func (d *domainRouter) domainRoutes(dst, src *App, walk domainClone) [][]*Route 
 						mounted = make(map[*Group][][]*Route)
 					}
 					mounted[group] = d.domainRoutes(dst, group.app, domainClone{
-						prefix:       getGroupPath(walk.prefix, source.route.path),
+						prefix:       getGroupPath(walk.prefix, source.route.Path),
 						chain:        append(walk.chain, src),
 						skipAutoHead: skipAutoHead,
 					})
@@ -675,18 +677,15 @@ func (d *domainRouter) domainRoutes(dst, src *App, walk domainClone) [][]*Route 
 				dst.addPrefixToRoute(walk.prefix, clonedRoute, src.config.RegexHandler, constraints...)
 			}
 			clonedRoute.docHandlers = clonedRoute.InnerHandlers()
-			// A route of the mounted app answers on this domain unless the sub-app already scoped it to its own.
-			if clonedRoute.domain == "" {
-				clonedRoute.domain = d.pattern()
-			}
 			clonedRoute.Handlers = d.wrapHandlers(clonedRoute.Handlers)
+			clonedRoute.hosts = append(slices.Clone(clonedRoute.hosts), d.matcher)
 
 			// Record the app the route came from, so a request that runs it
 			// resolves that app's config rather than one inferred from the host
 			// and the path.
 			dst.markRouteOwner(clonedRoute, source.owner)
 
-			if skipAutoHead {
+			if skipAutoHead || source.skipAutoHead {
 				dst.markSkipAutoHead(clonedRoute)
 			}
 

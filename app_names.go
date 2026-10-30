@@ -96,7 +96,7 @@ func (app *App) nameRoutesLocked(regID uint64, name string) *Route {
 	if named != nil && named.use {
 		for _, routes := range app.stack {
 			for _, route := range routes {
-				if route.mount || !route.use || route.Path != named.Path || route == named {
+				if route.mount || !route.use || route.Path != named.Path || route == named || matchersKey(route.hosts) != matchersKey(named.hosts) {
 					continue
 				}
 				setName(route)

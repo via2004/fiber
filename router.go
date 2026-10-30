@@ -9,7 +9,9 @@ import (
 	"fmt"
 	"math/bits"
 	"slices"
+	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 
 	"github.com/gofiber/fiber/v3/internal/urlnorm"
@@ -144,18 +146,22 @@ type Route struct { // betteralign:ignore - see below
 	// by its per-method copies, so one of them can be found again in another
 	// method's tree (see routeIndexInTree). It never changes once assigned.
 	id uint64
+	// copies is the number of method stacks the registration filed a copy in.
+	copies int
 
 	Handlers []Handler `json:"-"` // Ctx handlers
 
 	group *Group // Group instance. used for routes in groups
+
+	// hosts are the patterns of the Domain routers the route was registered
+	// through, outermost last; its handlers decline a hostname that fails one.
+	hosts []domainMatcher
 
 	// Public fields
 	Method string `json:"method"` // HTTP method
 	Name   string `json:"name"`   // Route's name
 	//nolint:revive // Having both a Path (uppercase) and a path (lowercase) is fine
 	Path string `json:"path"` // Original registered route path
-
-	domain string // Host pattern from app.Domain(), empty otherwise
 
 	groupPrefix string
 	groupName   string
@@ -210,6 +216,13 @@ type routeTree struct {
 	globalFilter *bucketFilter
 	// globals is the bucket for tree hash 0, which is also where misses go
 	globals []*Route
+	// positions maps each route of routes to its index, and ids each registration id
+	// to its first route there that is no automatic HEAD route; built on first use
+	positions map[*Route]int
+	ids       map[uint64]int
+	// routes is the method's stack this tree was built from, in registration order
+	routes        []*Route
+	positionsOnce sync.Once
 	// mask is len(hashes)-1, used to wrap the probe
 	mask uint32
 	// shift is 32-log2(len(hashes)), so slot keeps the high bits of the
@@ -543,9 +556,13 @@ func (r *Route) InnerHandlers() []Handler {
 	return r.Handlers
 }
 
-// Domain returns the host pattern from app.Domain, or "" for any host.
+// Domain returns the host pattern from app.Domain, or "" for any host. A route behind several
+// patterns, as a Domain-mounted app's route can be, reports the innermost.
 func (r *Route) Domain() string {
-	return r.domain
+	if len(r.hosts) == 0 {
+		return ""
+	}
+	return r.hosts[0].pattern
 }
 
 // RouteParameter describes an input captured by a route. Content wins over Schema/SchemaRef.
@@ -1225,7 +1242,7 @@ func (app *App) customRequestHandler(rctx *fasthttp.RequestCtx) {
 }
 
 func (app *App) addPrefixToRoute(prefix string, route *Route, regexHandler any, customConstraints ...CustomConstraint) {
-	prefixedPath, prettyPath, cleanPath := normalizeRoutePattern(getGroupPath(prefix, route.Path), &app.config)
+	prefixedPath, prettyPath, cleanPath := normalizeRoutePattern(getGroupPath(prefix, route.Path), &app.config, route.use)
 
 	route.Path = prefixedPath
 	route.path = cleanPath
@@ -1235,6 +1252,9 @@ func (app *App) addPrefixToRoute(prefix string, route *Route, regexHandler any, 
 	route.routeParser.adoptConstraints(&rawParser)
 	if app.config.StrictRouting {
 		route.routeParser.applyStrictRouting()
+	}
+	if route.use {
+		route.routeParser.markTail()
 	}
 	// A prefix can introduce parameters of its own — a sub-app mounted at
 	// "/v1/:version" is prefixing every one of its routes with one. Params
@@ -1258,7 +1278,7 @@ func (app *App) addPrefixToRoute(prefix string, route *Route, regexHandler any, 
 }
 
 func (app *App) normalizePath(path string) string {
-	_, _, clean := normalizeRoutePattern(path, &app.config)
+	_, _, clean := normalizeRoutePattern(path, &app.config, false)
 	return clean
 }
 
@@ -1266,10 +1286,15 @@ func (app *App) normalizePath(path string) string {
 // If no methods are specified, it will remove the route for all methods defined in the app.
 // You should call RebuildTree after using this to ensure consistency of the tree.
 func (app *App) RemoveRoute(path string, methods ...string) {
-	// Normalize same as register uses
+	// Normalize same as register uses: a prefix (use) route is keyed without
+	// its trailing slash under StrictRouting too (see normalizeRoutePattern)
 	norm := app.normalizePath(path)
+	_, _, normUse := normalizeRoutePattern(path, &app.config, true)
 
 	pathMatchFunc := func(r *Route) bool {
+		if r.use {
+			return r.path == normUse
+		}
 		return r.path == norm // compare private normalized path
 	}
 	app.deleteRoute(methods, pathMatchFunc)
@@ -1432,7 +1457,7 @@ func (app *App) pruneAutoHeadRouteLocked(route *Route) {
 // autoHeadTwinLocked finds the auto-HEAD route built for key, or -1 and nil; the caller must hold app.mutex.
 func (app *App) autoHeadTwinLocked(headIndex int, key autoHeadKey) (int, *Route) {
 	for i, head := range app.stack[headIndex] {
-		if !head.autoHead || head.path != key.path || head.domain != key.domain {
+		if !head.autoHead || head.path != key.path || matchersKey(head.hosts) != key.hosts {
 			continue
 		}
 		if app.mountFields.hostScopedRoutes && app.routeOwner(head) != key.owner {
@@ -1462,12 +1487,12 @@ func (app *App) explicitHeadPositionLocked(m int, route *Route) int {
 	return len(app.stack[m])
 }
 
-func (app *App) register(methods []string, pathRaw string, group *Group, domain string, handlers ...Handler) uint64 {
-	return app.registerChain(methods, pathRaw, group, domain, nil, handlers)
+func (app *App) register(methods []string, pathRaw string, group *Group, handlers ...Handler) uint64 {
+	return app.registerChain(methods, pathRaw, group, nil, nil, handlers)
 }
 
 // registerChain is register for a chain a domain router wrapped in its host check; inner is the chain as registered.
-func (app *App) registerChain(methods []string, pathRaw string, group *Group, domain string, inner, handlers []Handler) uint64 {
+func (app *App) registerChain(methods []string, pathRaw string, group *Group, hosts []domainMatcher, inner, handlers []Handler) uint64 {
 	// A regular route requires at least one ctx handler
 	if len(handlers) == 0 && group == nil {
 		panic(fmt.Sprintf("missing handler/middleware in route: %s\n", pathRaw))
@@ -1479,10 +1504,9 @@ func (app *App) registerChain(methods []string, pathRaw string, group *Group, do
 		}
 	}
 
-	routeID := routeIDs.Add(1)
-
 	// Precompute path normalization ONCE
-	pathRaw, pathPretty, pathClean := normalizeRoutePattern(pathRaw, &app.config)
+	use := slices.Contains(methods, methodUse)
+	pathRaw, pathPretty, pathClean := normalizeRoutePattern(pathRaw, &app.config, use)
 
 	app.mutex.Lock()
 	constraints := app.customConstraints
@@ -1496,8 +1520,16 @@ func (app *App) registerChain(methods []string, pathRaw string, group *Group, do
 	if app.config.StrictRouting {
 		parsedPretty.applyStrictRouting()
 	}
+	if use {
+		parsedPretty.markTail()
+	}
 
 	isMount := group != nil && group.app != app
+	routeID := routeIDs.Add(1)
+	// Merge in every stack the registration files a copy in, or in none, so the copies
+	// keep one layout for routeIndexInTree and the automatic HEAD routes.
+	stacks := app.registrationStacks(methods)
+	merge := app.mergesInEveryStack(&Route{Path: pathRaw, use: use, mount: isMount, hosts: hosts}, stacks)
 
 	for _, method := range methods {
 		method = utilsstrings.ToUpper(method)
@@ -1518,7 +1550,8 @@ func (app *App) registerChain(methods []string, pathRaw string, group *Group, do
 			caseSensitive: app.config.CaseSensitive,
 			unescapePath:  app.config.UnescapePath,
 			id:            routeID,
-			domain:        domain,
+			copies:        len(stacks),
+			hosts:         hosts,
 
 			path:        pathClean,
 			routeParser: parsedPretty,
@@ -1541,27 +1574,76 @@ func (app *App) registerChain(methods []string, pathRaw string, group *Group, do
 			for _, m := range app.config.RequestMethods {
 				// Create a route copy to avoid duplicates during compression
 				r := route
-				app.addRoute(m, &r)
+				app.addRoute(m, &r, merge)
 			}
 		} else {
 			// Add route to stack
-			app.addRoute(method, &route)
+			app.addRoute(method, &route, merge)
 		}
 	}
 
 	return routeID
 }
 
-func (app *App) addRoute(method string, route *Route) {
-	if hookRoute := app.insertRoute(method, route); hookRoute != nil {
+func (app *App) addRoute(method string, route *Route, merge bool) { //nolint:revive // flag-parameter: register decides it once for every method of a Use
+	if hookRoute := app.insertRoute(method, route, merge); hookRoute != nil {
 		if err := app.hooks.executeOnRouteHooks(hookRoute); err != nil {
 			panic(err)
 		}
 	}
 }
 
+// registrationStacks returns the indexes of the method stacks register files a copy in.
+func (app *App) registrationStacks(methods []string) []int {
+	stacks := make([]int, 0, len(methods))
+	for _, method := range methods {
+		method = utilsstrings.ToUpper(method)
+		if method == methodUse {
+			for m := range app.config.RequestMethods {
+				stacks = append(stacks, m)
+			}
+		} else if m := app.methodInt(method); m != -1 {
+			stacks = append(stacks, m)
+		}
+	}
+	return stacks
+}
+
+// mergesIntoLastLocked reports whether route merges into the last route of stack m. One path
+// behind two Domain patterns stays two routes, each with its own name; the caller holds app.mutex.
+func (app *App) mergesIntoLastLocked(m int, route *Route) bool {
+	l := len(app.stack[m])
+	if l == 0 {
+		return false
+	}
+	last := app.stack[m][l-1]
+	return last.Path == route.Path && route.use == last.use && !route.mount && !last.mount && !last.autoHead &&
+		matchersKey(last.hosts) == matchersKey(route.hosts)
+}
+
+// mergesInEveryStack reports whether a registration filing route in stacks merges
+// into the last route of each: the copies of one registration made for as many stacks.
+func (app *App) mergesInEveryStack(route *Route, stacks []int) bool {
+	app.mutex.Lock()
+	defer app.mutex.Unlock()
+
+	var last *Route
+	for _, m := range stacks {
+		if !app.mergesIntoLastLocked(m, route) {
+			return false
+		}
+		prev := last
+		last = app.stack[m][len(app.stack[m])-1]
+		if prev != nil && prev.id != last.id {
+			return false
+		}
+	}
+	// A copy under another method would miss the handlers and fall out of step.
+	return last != nil && last.copies == len(stacks)
+}
+
 // insertRoute adds the route under the router lock and returns the snapshot the OnRoute hooks receive, if any.
-func (app *App) insertRoute(method string, route *Route) *Route {
+func (app *App) insertRoute(method string, route *Route, merge bool) *Route { //nolint:revive // flag-parameter: register decides it once for every method of a Use
 	app.mutex.Lock()
 	defer app.mutex.Unlock()
 
@@ -1577,10 +1659,8 @@ func (app *App) insertRoute(method string, route *Route) *Route {
 	liveRoute := route
 
 	// prevent identically route registration
-	l := len(app.stack[m])
-	if l > 0 && app.stack[m][l-1].Path == route.Path && route.use == app.stack[m][l-1].use &&
-		!route.mount && !app.stack[m][l-1].mount && app.stack[m][l-1].domain == route.domain {
-		preRoute := app.stack[m][l-1]
+	if merge && app.mergesIntoLastLocked(m, route) {
+		preRoute := app.stack[m][len(app.stack[m])-1]
 		preRoute.Handlers = append(preRoute.Handlers, route.Handlers...)
 		preRoute.docHandlers = append(preRoute.docHandlers, route.docHandlers...)
 		// Name prefixes with the group of the route it renames, which for this
@@ -1630,9 +1710,10 @@ func (app *App) ensureAutoHeadRoutes() []*Route {
 type autoHeadKey struct {
 	// owner is set only where routes are host-scoped, and is what keeps the
 	// HEAD route of one mounted app from standing in for another app's GET
-	owner  *App
-	domain string
-	path   string
+	owner *App
+	path  string
+	// hosts keeps one Domain pattern's HEAD route from standing in for another's GET
+	hosts string
 }
 
 // autoHeadKey returns the key route is deduplicated under. Where an app's
@@ -1641,12 +1722,19 @@ type autoHeadKey struct {
 // pattern rejects it declines, leaving a GET route of another one there without
 // a companion to answer for it.
 func (app *App) autoHeadKey(route *Route) autoHeadKey {
-	key := autoHeadKey{domain: route.domain, path: route.path}
+	key := autoHeadKey{path: route.path, hosts: matchersKey(route.hosts)}
 	if app.mountFields.hostScopedRoutes {
 		key.owner = app.routeOwner(route)
 	}
 
 	return key
+}
+
+// routeCopyKey pairs the copies one registration leaves in different method
+// stacks; an automatic HEAD route counts as a copy of its GET route.
+type routeCopyKey struct {
+	path string
+	id   uint64
 }
 
 // ensureAutoHeadRoutesLocked creates missing auto-HEAD twins and returns snapshots; the caller holds app.mutex.
@@ -1675,33 +1763,67 @@ func (app *App) ensureAutoHeadRoutesLocked() []*Route {
 	}
 
 	headStack := app.stack[headIndex]
-	existing := make(map[autoHeadKey]struct{}, len(headStack))
-	for _, route := range headStack {
-		if route.mount || route.use {
-			continue
-		}
-		existing[app.autoHeadKey(route)] = struct{}{}
-	}
-
-	if len(app.stack[getIndex]) == 0 {
+	getStack := app.stack[getIndex]
+	if len(getStack) == 0 {
 		recordScan()
 		return nil
 	}
 
-	var (
-		twins []*Route
-		added bool
-	)
+	var twins []*Route
+	// A HEAD route that copies a GET route's registration (a Use, a mount, an
+	// Add of both methods or an earlier companion) holds that route's position.
+	onGet := make(map[routeCopyKey]int, len(getStack))
+	for _, route := range getStack {
+		onGet[routeCopyKey{path: route.Path, id: route.id}]++
+	}
+	copies := make(map[routeCopyKey][]int)
+	explicit := make(map[autoHeadKey]struct{}, len(headStack))
+	for i, route := range headStack {
+		if key := (routeCopyKey{path: route.Path, id: route.id}); onGet[key] > 0 {
+			// The HEAD copy of an All or Add answers for that registration alone.
+			copies[key] = append(copies[key], i)
+			continue
+		}
+		if !route.mount && !route.use && !route.autoHead {
+			explicit[app.autoHeadKey(route)] = struct{}{}
+		}
+	}
 
-	for _, route := range app.stack[getIndex] {
+	// Rebuilt in GET order, so a guard registered with Get runs for HEAD where it runs for GET.
+	merged := make([]*Route, 0, len(headStack)+len(getStack))
+	next := 0 // headStack[:next] is in merged
+	var added bool
+
+	for _, route := range getStack {
+		key := routeCopyKey{path: route.Path, id: route.id}
+		if at := copies[key]; len(at) > 0 {
+			copies[key] = at[1:]
+			// A Get registered after startup can have merged into route.
+			if head := headStack[at[0]]; head.autoHead && len(head.Handlers) != len(route.Handlers) {
+				atomic.AddUint32(&app.handlersCount, uint32(len(route.Handlers)-len(head.Handlers))) //nolint:gosec // G115 - a merge only appends
+				head.Handlers = route.Handlers
+			}
+			if at[0] >= next {
+				merged = append(merged, headStack[next:at[0]+1]...)
+				next = at[0] + 1
+			}
+			continue
+		}
 		if route.mount || route.use {
 			continue
 		}
-		if _, ok := existing[app.autoHeadKey(route)]; ok {
+		if _, ok := explicit[app.autoHeadKey(route)]; ok {
 			continue
 		}
 		if app.skipsAutoHeadFor(route) {
 			continue
+		}
+
+		// A HEAD-only route has no GET position; one registered earlier stays ahead.
+		for next < len(headStack) && headStack[next].id < route.id &&
+			onGet[routeCopyKey{path: headStack[next].Path, id: headStack[next].id}] == 0 {
+			merged = append(merged, headStack[next])
+			next++
 		}
 
 		headRoute := app.copyRouteBase(route)
@@ -1719,8 +1841,7 @@ func (app *App) ensureAutoHeadRoutesLocked() []*Route {
 		// HEAD responses, so the copied GET handler stack can execute
 		// unchanged while still producing an empty body on the wire.
 
-		headStack = append(headStack, headRoute)
-		existing[app.autoHeadKey(route)] = struct{}{}
+		merged = append(merged, headRoute)
 		app.hasRoutesRefreshed = true
 		added = true
 		if len(app.hooks.onRoute) > 0 {
@@ -1731,7 +1852,7 @@ func (app *App) ensureAutoHeadRoutesLocked() []*Route {
 	}
 
 	if added {
-		app.stack[headIndex] = headStack
+		app.stack[headIndex] = append(merged, headStack[next:]...)
 		app.bumpRoutesRevision()
 	}
 	recordScan()
@@ -1770,19 +1891,94 @@ func (app *App) rebuildTreeLocked() []*Route {
 	return twins
 }
 
-// routeIndexInTree returns the position of route in another method's tree
-// bucket, or current when it is not there; copies are told apart by their shared id.
+// routeIndexInTree returns the index in the bucket of methodInt and treeHash
+// that Next resumes behind: the last route there registered no later than route.
 func (app *App) routeIndexInTree(methodInt, treeHash int, route *Route, current int) int {
 	if route == nil || methodInt < 0 || methodInt >= len(app.treeIndex) {
 		return current
 	}
-	candidates, _ := app.treeIndex[methodInt].lookup(treeHash)
-	for i, candidate := range candidates {
-		if candidate.id == route.id {
-			return i
-		}
+	tree := app.treeIndex[methodInt]
+	tree.indexPositions()
+
+	// route itself after a path change, else its copy under the new method. An
+	// automatic HEAD copy shares the id but is left to routesAhead.
+	pos, ok := tree.positions[route]
+	if !ok {
+		pos, ok = tree.ids[route.id]
 	}
-	return current
+	if !ok {
+		ahead, found := app.routesAhead(route)
+		if !found {
+			// Resume early: rerunning a route is safer than skipping a guard.
+			return -1
+		}
+		pos = lastCopyIndex(tree.routes, ahead)
+	}
+
+	// Every bucket is a subsequence of tree.routes, so its routes up to pos lead it. The
+	// search gallops from the front, where they end for a route registered ahead of most.
+	bucket, _ := tree.lookup(treeHash)
+	n := 1
+	for n <= len(bucket) && tree.positions[bucket[n-1]] <= pos {
+		n *= 2
+	}
+	lo, hi := n/2, min(n-1, len(bucket))
+	return lo + sort.Search(hi-lo, func(i int) bool { return tree.positions[bucket[lo+i]] > pos }) - 1
+}
+
+// indexPositions builds positions and ids once per tree, as only overrides read them.
+func (t *routeTree) indexPositions() {
+	t.positionsOnce.Do(func() {
+		t.positions = make(map[*Route]int, len(t.routes))
+		t.ids = make(map[uint64]int, len(t.routes))
+		for i, route := range t.routes {
+			t.positions[route] = i
+			if _, ok := t.ids[route.id]; !ok && !route.autoHead {
+				t.ids[route.id] = i
+			}
+		}
+	})
+}
+
+// routesAhead returns route's own method stack up to and including route. An
+// automatic HEAD route stands where its GET route does.
+func (app *App) routesAhead(route *Route) ([]*Route, bool) {
+	own := app.methodInt(route.Method)
+	if route.autoHead {
+		own = app.methodInt(MethodGet)
+	}
+	if own < 0 || own >= len(app.treeIndex) {
+		return nil, false
+	}
+	tree := app.treeIndex[own]
+	tree.indexPositions()
+	end, ok := tree.positions[route]
+	if !ok && route.autoHead {
+		end, ok = tree.ids[route.id]
+	}
+	if !ok {
+		return nil, false
+	}
+	return tree.routes[:end+1], true
+}
+
+// lastCopyIndex returns the index of the last route in routes that copies one in
+// ahead, or -1. Routes only the other method holds stay behind it, unordered.
+func lastCopyIndex(routes, ahead []*Route) int {
+	// Counted, not collected: an app mounted twice repeats its ids.
+	counts := make(map[uint64]int, len(ahead))
+	for _, route := range ahead {
+		counts[route.id]++
+	}
+	last := -1
+	for i, route := range routes {
+		if route.autoHead || counts[route.id] == 0 {
+			continue
+		}
+		counts[route.id]--
+		last = i
+	}
+	return last
 }
 
 // buildTree build the prefix tree from the previously registered routes
@@ -1870,7 +2066,10 @@ func (app *App) buildTree() {
 		}
 
 		app.treeStack[method] = tsMap
-		app.treeIndex[method] = buildRouteTree(tsMap)
+		tree := buildRouteTree(tsMap)
+		// Cloned like the buckets: the stack is edited in place.
+		tree.routes = slices.Clone(routes)
+		app.treeIndex[method] = tree
 	}
 	app.hasParamRoutes = hasParamRoutes
 

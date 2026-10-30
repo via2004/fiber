@@ -26,6 +26,8 @@ type mountFields struct {
 	// path for different hosts would displace each other, and a lookup would
 	// answer for hosts the domain pattern rejects.
 	domainAppList []domainMountedApp
+	// HEAD routes created for mounted apps while expanding mounts, whose hooks fire after the lock is released.
+	createdTwins []subAppTwins
 	// Routes that arrived from a mount which registers no automatic HEAD
 	// routes, kept by route because a path can belong to a mount and to this
 	// app at once
@@ -61,6 +63,9 @@ type domainMountedApp struct {
 	parser *routeParser
 	// path is the full mount path, normalized by the app it is mounted on
 	path string
+	// pattern is the full mount path as written. path is a comparison key and
+	// reads differently as a pattern, so this is what gets parsed and composed.
+	pattern string
 	// matchers are the patterns of the domain routers this app was mounted
 	// behind, outermost last. A request has to satisfy all of them.
 	matchers []domainMatcher
@@ -84,11 +89,12 @@ type mountedRoute struct {
 // with the routing rules of the app it is being mounted on, so the lookups
 // recognize it the same way the router recognizes its routes.
 func (app *App) newDomainMount(mounted *App, path string, matchers []domainMatcher, ancestors []*App, declared []CustomConstraint) domainMountedApp {
-	normalized := app.normalizePath(path)
+	raw, pretty, clean := normalizeRoutePattern(path, &app.config, true)
 
 	mount := domainMountedApp{
 		app:       mounted,
-		path:      normalized,
+		path:      clean,
+		pattern:   raw,
 		matchers:  matchers,
 		ancestors: ancestors,
 		declared:  declared,
@@ -99,23 +105,27 @@ func (app *App) newDomainMount(mounted *App, path string, matchers []domainMatch
 	// define a name, as they do when a mount's routes are re-parsed.
 	constraints := mergeCustomConstraints(slices.Clone(declared), app.customConstraints)
 
-	if parser := parseRoute(normalized, app.config.RegexHandler, constraints...); len(parser.params) > 0 {
+	if parser := parseRoute(pretty, app.config.RegexHandler, constraints...); len(parser.params) > 0 {
+		// As in register: the constraints come from the pattern as written.
+		rawParser := parseRoute(raw, app.config.RegexHandler, constraints...)
+		parser.adoptConstraints(&rawParser)
+		parser.markTail()
 		mount.parser = &parser
 	}
 
 	return mount
 }
 
-// covers reports whether this mount covers path, which is matched as a pattern
-// when the mount path carries parameters.
-func (m *domainMountedApp) covers(path string) bool {
+// covers reports whether this mount covers a request, matched as a pattern when
+// the mount path carries parameters; as for a route, constraints see path.
+func (m *domainMountedApp) covers(detectionPath, path string) bool {
 	if m.parser != nil {
 		var params [maxParams]string
 
-		return m.parser.getMatch(path, path, &params, true)
+		return m.parser.getMatch(detectionPath, path, &params, true)
 	}
 
-	return strings.HasPrefix(utils.AddTrailingSlashString(path), utils.AddTrailingSlashString(m.path))
+	return strings.HasPrefix(utils.AddTrailingSlashString(detectionPath), utils.AddTrailingSlashString(m.path))
 }
 
 // matchesHost reports whether hostname satisfies every domain pattern the app
@@ -198,7 +208,7 @@ func (app *App) mount(prefix string, subApp *App) Router {
 
 	// register mounted group
 	mountGroup := newGroup(subApp, prefix, nil)
-	app.register([]string{methodUse}, prefix, mountGroup, allHosts)
+	app.register([]string{methodUse}, prefix, mountGroup)
 
 	// Execute onMount hooks
 	if err := subApp.hooks.executeOnMountHooks(app); err != nil {
@@ -230,7 +240,7 @@ func (grp *Group) mount(prefix string, subApp *App) Router {
 
 	// register mounted group
 	mountGroup := newGroup(subApp, groupPath, nil)
-	grp.cursor.Store(grp.app.register([]string{methodUse}, groupPath, mountGroup, allHosts))
+	grp.cursor.Store(grp.app.register([]string{methodUse}, groupPath, mountGroup))
 
 	// Execute onMount hooks
 	if err := subApp.hooks.executeOnMountHooks(grp.app); err != nil {
@@ -350,11 +360,11 @@ func (app *App) domainMountOwner(c Ctx) domainOwner {
 
 	var owner, byRoute domainOwner
 
-	path := app.normalizePath(c.Path())
+	detectionPath, path := c.getDetectionPath(), c.Path()
 
 	for i := range app.mountFields.domainAppList {
 		mount := &app.mountFields.domainAppList[i]
-		if !mount.covers(path) || !mount.matchesHost(c.Hostname()) {
+		if !mount.covers(detectionPath, path) || !mount.matchesHost(c.Hostname()) {
 			continue
 		}
 
@@ -496,7 +506,7 @@ func (w *mountWalk) add(app *App, prefix string, matchers []domainMatcher, decla
 	for _, mount := range app.domainMountsSnapshot() {
 		w.add(
 			mount.app,
-			getGroupPath(prefix, mount.path),
+			getGroupPath(prefix, mount.pattern),
 			append(slices.Clone(mount.matchers), matchers...),
 			declared,
 			chain,
@@ -661,7 +671,7 @@ func (app *App) appendDomainMounts(dst, mounts []domainMountedApp, prefix string
 		// ancestors are the apps between it and them, and it is the outermost.
 		ancestors := append([]*App{owner}, mount.ancestors...)
 
-		moved := app.newDomainMount(mount.app, getGroupPath(prefix, mount.path), mount.matchers, ancestors, mount.declared)
+		moved := app.newDomainMount(mount.app, getGroupPath(prefix, mount.pattern), mount.matchers, ancestors, mount.declared)
 		dst = addDomainMount(dst, &moved)
 	}
 
@@ -772,25 +782,26 @@ func (app *App) appendSubAppLists(appList map[string]*App, parent ...string) {
 }
 
 // expandMountsOnce expands the mounts of a mounted app once, under its lock, taken before the Once as in
-// the app's own startup, so a parent expanding it cannot deadlock against it starting by itself.
-func (app *App) expandMountsOnce() {
+// the app's own startup, so a parent expanding it cannot deadlock against it starting by itself. It
+// returns the automatic HEAD routes the expansion created, whose hooks the caller fires unlocked.
+func (app *App) expandMountsOnce() []subAppTwins {
 	app.mutex.Lock()
 	defer app.mutex.Unlock()
 	if app.hasMountedApps() {
 		app.mountFields.subAppsRoutesAdded.Do(app.processSubAppsRoutes)
 	}
+	return app.takeCreatedTwinsLocked()
+}
+
+// takeCreatedTwinsLocked hands over the HEAD routes created for mounted apps while expanding mounts.
+func (app *App) takeCreatedTwinsLocked() []subAppTwins {
+	twins := app.mountFields.createdTwins
+	app.mountFields.createdTwins = nil
+	return twins
 }
 
 // processSubAppsRoutes adds routes of sub-apps recursively when the server is started
 func (app *App) processSubAppsRoutes() {
-	for prefix, subApp := range app.mountFields.appList {
-		// skip real app
-		if prefix == "" {
-			continue
-		}
-		// process the inner routes
-		subApp.expandMountsOnce()
-	}
 	var handlersCount uint32
 	// Iterate over the stack of the parent app
 	for m := range app.stack {
@@ -806,7 +817,13 @@ func (app *App) processSubAppsRoutes() {
 				continue
 			}
 
+			// Prepared here, not from appList, which keeps one app per prefix; its own HEAD
+			// routes come first, so a flattened child's HEAD route cannot stand in for them.
 			subApp := route.group.app
+			if created := subApp.ensureAutoHeadRoutes(); len(created) > 0 {
+				app.mountFields.createdTwins = append(app.mountFields.createdTwins, subAppTwins{app: subApp, twins: created})
+			}
+			app.mountFields.createdTwins = append(app.mountFields.createdTwins, subApp.expandMountsOnce()...)
 
 			// Locks are taken parent first, then sub-app, and released before the routes are re-parsed.
 			subApp.mutex.Lock()
@@ -850,8 +867,9 @@ func (app *App) processSubAppsRoutes() {
 				// one constraint differently, and neither binds the other.
 				constraints := mergeCustomConstraints(source.constraints, app.customConstraints)
 
-				// Add the parent route's path as a prefix to the sub-app's route
-				app.addPrefixToRoute(route.path, source.clone, subApp.config.RegexHandler, constraints...)
+				// The prefix is parsed again, so it has to be the pattern as written:
+				// route.path lost the case and escapes parameters are read from.
+				app.addPrefixToRoute(route.Path, source.clone, subApp.config.RegexHandler, constraints...)
 				app.markRouteConstraints(source.clone, constraints)
 
 				// Carry the sub-app's stance on automatic HEAD routes over to

@@ -4,11 +4,6 @@
 
 package fiber
 
-import (
-	"fmt"
-	"reflect"
-)
-
 // Group represents a collection of routes that share middleware and a common
 // path prefix.
 type Group struct {
@@ -71,31 +66,7 @@ func (grp *Group) Name(name string) Router {
 //
 // This method will match all HTTP verbs: GET, POST, PUT, HEAD etc...
 func (grp *Group) Use(args ...any) Router {
-	var subApp *App
-	var prefix string
-	var prefixes []string
-	var handlers []Handler
-
-	for i := range args {
-		switch arg := args[i].(type) {
-		case string:
-			prefix = arg
-		case *App:
-			subApp = arg
-		case []string:
-			prefixes = arg
-		default:
-			handler, ok := toFiberHandler(arg)
-			if !ok {
-				panic(fmt.Sprintf("use: invalid handler %v\n", reflect.TypeOf(arg)))
-			}
-			handlers = append(handlers, handler)
-		}
-	}
-
-	if len(prefixes) == 0 {
-		prefixes = append(prefixes, prefix)
-	}
+	prefixes, subApp, handlers := useArgs(args)
 
 	for _, prefix := range prefixes {
 		if subApp != nil {
@@ -103,7 +74,7 @@ func (grp *Group) Use(args ...any) Router {
 			continue
 		}
 
-		grp.cursor.Store(grp.app.register([]string{methodUse}, getGroupPath(grp.Prefix, prefix), grp, allHosts, handlers...))
+		grp.cursor.Store(grp.app.register([]string{methodUse}, getGroupPath(grp.Prefix, prefix), grp, handlers...))
 	}
 
 	if !grp.hasAnyRoute {
@@ -176,7 +147,7 @@ func (grp *Group) Query(path string, handler any, handlers ...any) Router {
 // The provided handlers are executed in order, starting with `handler` and then the variadic `handlers`.
 func (grp *Group) Add(methods []string, path string, handler any, handlers ...any) Router {
 	converted := collectHandlers("group", append([]any{handler}, handlers...)...)
-	grp.cursor.Store(grp.app.register(methods, getGroupPath(grp.Prefix, path), grp, allHosts, converted...))
+	grp.cursor.Store(grp.app.register(methods, getGroupPath(grp.Prefix, path), grp, converted...))
 	if !grp.hasAnyRoute {
 		grp.hasAnyRoute = true
 	}
@@ -200,7 +171,7 @@ func (grp *Group) Group(prefix string, handlers ...any) Router {
 	newGrp := newGroup(grp.app, prefix, grp)
 	if len(handlers) > 0 {
 		converted := collectHandlers("group", handlers...)
-		newGrp.cursor.Store(grp.app.register([]string{methodUse}, prefix, grp, allHosts, converted...))
+		newGrp.cursor.Store(grp.app.register([]string{methodUse}, prefix, grp, converted...))
 	}
 	if err := grp.app.hooks.executeOnGroupHooks(*newGrp); err != nil {
 		panic(err)
